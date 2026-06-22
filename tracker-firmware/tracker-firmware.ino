@@ -2,16 +2,16 @@
 #include <math.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include "secrets.h"
 
 // ========== CONFIGURAÇÃO DO WI-FI E REDE ==========
-const char* ssid     = "ALHN-5776"; 
-const char* password = "4573010088";
-const char* computerIP = "192.168.1.106"; 
-const unsigned int localPort = 2390;      // Porta local do Arduino
-const unsigned int remotePort = 4242;     // Porta que o PC vai escutar
+const char* ssid     = SECRET_SSID; 
+const char* password = SECRET_PASSWORD;
+const char* computerIP = SECRET_COMP_IP; 
+const unsigned int localPort = 2390;      
+const unsigned int remotePort = 4242;     
 
 WiFiUDP Udp;
-// ==================================================
 
 const int MPU_ADDR = 0x68; 
 int16_t rawAccX, rawAccY, rawAccZ;
