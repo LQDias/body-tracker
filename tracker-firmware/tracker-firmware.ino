@@ -1,47 +1,144 @@
 #include <Wire.h>
+#include <math.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "secrets.h"
 
-// Endereço I2C do MPU6050
+// ========== CONFIGURAÇÃO DO WI-FI E REDE ==========
+const char* ssid     = SECRET_SSID; 
+const char* password = SECRET_PASSWORD;
+const char* computerIP = SECRET_COMP_IP; 
+const unsigned int localPort = 2390;      
+const unsigned int remotePort = 4242;     
+
+WiFiUDP Udp;
+
 const int MPU_ADDR = 0x68; 
+int16_t rawAccX, rawAccY, rawAccZ;
+int16_t rawGyroX, rawGyroY, rawGyroZ;
 
-// Variáveis para dados brutos
-int16_t accelX, accelY, accelZ;
-int16_t gyroX, gyroY, gyroZ;
+float accX, accY, accZ;
+float gyroX, gyroY, gyroZ;
+
+float angleX = 0.0; // Roll
+float angleY = 0.0; // Pitch
+float angleZ = 0.0; // Yaw
+
+unsigned long lastTime;
+float dt;
+
+float gyroX_offset = 0.0; 
+float gyroY_offset = 0.0; 
+float gyroZ_offset = 0.0; 
 
 void setup() {
   Serial.begin(115200);
   Wire.begin();
   
-  // Inicializa o MPU6050 (Acorda o sensor)
+  // 1. Inicializa o MPU6050
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B); // Registrador de gerenciamento de energia (Power Management 1)
-  Wire.write(0);    // Define como 0 para acordar o sensor
+  Wire.write(0x6B); 
+  Wire.write(0);    
   Wire.endTransmission(true);
+
+  // 2. Conecta ao Wi-Fi
+  Serial.print("Conectando em: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi Conectado!");
+  
+  // NOVA TRAVA: Espera até o roteador entregar um IP real
+  while (WiFi.localIP()[0] == 0) {
+    delay(500);
+    Serial.print("Aguardando IP do roteador...");
+  }
+
+  Serial.print("IP do Arduino: ");
+  Serial.println(WiFi.localIP());
+
+  Udp.begin(localPort);
+
+  // 4. Calibração
+  Serial.println("Calibrando o sensor... NAO MEXA!");
+  long gyroX_sum = 0, gyroY_sum = 0, gyroZ_sum = 0;
+  int validSamples = 0;
+  
+  while (validSamples < 400) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x43); 
+    if (Wire.endTransmission(false) != 0) { delay(2); continue; }
+    
+    Wire.requestFrom(MPU_ADDR, 6, true);
+    if (Wire.available() < 6) { delay(2); continue; }
+    
+    gyroX_sum += (int16_t)(Wire.read() << 8 | Wire.read());
+    gyroY_sum += (int16_t)(Wire.read() << 8 | Wire.read());
+    gyroZ_sum += (int16_t)(Wire.read() << 8 | Wire.read());
+    validSamples++;
+    delay(3);
+  }
+  
+  gyroX_offset = (float)gyroX_sum / 400.0;
+  gyroY_offset = (float)gyroY_sum / 400.0;
+  gyroZ_offset = (float)gyroZ_sum / 400.0;
+  
+  Serial.println("Calibrado e pronto para transmitir!");
+  lastTime = millis();
 }
 
 void loop() {
-  // Aponta para o primeiro registrador de dados (Accel X High)
+  unsigned long currentTime = millis();
+  dt = (currentTime - lastTime) / 1000.0;
+  lastTime = currentTime;
+  if (dt <= 0.0) dt = 0.001;
+
+  // Leitura do MPU6050
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B); 
-  Wire.endTransmission(false);
+  if (Wire.endTransmission(false) != 0) return;
   
-  // Solicita 14 bytes (6 para acel, 2 para temp, 6 para giro)
   Wire.requestFrom(MPU_ADDR, 14, true);
+  if (Wire.available() < 14) return;
+
+  rawAccX = Wire.read() << 8 | Wire.read();
+  rawAccY = Wire.read() << 8 | Wire.read();
+  rawAccZ = Wire.read() << 8 | Wire.read();
+  Wire.read(); Wire.read(); 
+  rawGyroX = Wire.read() << 8 | Wire.read();
+  rawGyroY = Wire.read() << 8 | Wire.read();
+  rawGyroZ = Wire.read() << 8 | Wire.read();
   
-  // Leitura dos dados combinando High e Low Byte
-  accelX = Wire.read() << 8 | Wire.read();
-  accelY = Wire.read() << 8 | Wire.read();
-  accelZ = Wire.read() << 8 | Wire.read();
+  accX = (float)rawAccX / 16384.0;
+  accY = (float)rawAccY / 16384.0;
+  accZ = (float)rawAccZ / 16384.0;
   
-  int16_t temp = Wire.read() << 8 | Wire.read(); // Temperatura (ignorada por enquanto)
+  gyroX = ((float)rawGyroX - gyroX_offset) / 131.0;
+  gyroY = ((float)rawGyroY - gyroY_offset) / 131.0;
+  gyroZ = ((float)rawGyroZ - gyroZ_offset) / 131.0;
+
+  if (fabs(gyroZ) < 1.5) gyroZ = 0.0;
+
+  float accAngleX = atan2(accY, sqrt(accX * accX + accZ * accZ)) * 57.2958;
+  float accAngleY = atan2(-accX, sqrt(accY * accY + accZ * accZ)) * 57.2958;
+
+  angleX = 0.98 * (angleX + gyroX * dt) + 0.02 * accAngleX;
+  angleY = 0.98 * (angleY + gyroY * dt) + 0.02 * accAngleY;
+  angleZ = angleZ + gyroZ * dt; 
+
+  // ================= TRANSMISSÃO SEM FIO (UDP) =================
+  String packetData = String(angleX) + "," + String(angleY) + "," + String(angleZ);
   
-  gyroX = Wire.read() << 8 | Wire.read();
-  gyroY = Wire.read() << 8 | Wire.read();
-  gyroZ = Wire.read() << 8 | Wire.read();
+  Udp.beginPacket(computerIP, remotePort);
+  Udp.print(packetData);
+  Udp.endPacket();
+  // =============================================================
+
+  Serial.println(packetData);
   
-  // Printa no Serial Plotter/Monitor para testar
-  Serial.print("AccX:"); Serial.print(accelX); Serial.print(",");
-  Serial.print("AccY:"); Serial.print(accelY); Serial.print(",");
-  Serial.print("GyroX:"); Serial.println(gyroX);
-  
-  delay(10); // Taxa de amostragem inicial de ~100Hz
+  delay(10); // Envia pacotes a aprox. 100Hz
 }
